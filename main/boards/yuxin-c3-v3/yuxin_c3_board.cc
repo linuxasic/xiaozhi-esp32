@@ -11,6 +11,9 @@
 #include "adc_battery_monitor.h"
 #include "press_to_talk_mcp_tool.h"
 #include "aht20.h"
+#include "alarm_manager.h"
+#include "alarm_task.h"
+#include "assets/lang_config.h"
 
 #include <wifi_manager.h>
 #include <esp_log.h>
@@ -34,6 +37,23 @@ private:
     Aht20* aht20_ = nullptr;
     float last_temperature_ = 0.0f;
     float last_humidity_ = 0.0f;
+        AlarmManager* alarm_manager_ = nullptr;
+    
+    // 闹钟响铃状态
+    bool alarm_ringing_ = false;
+    int ringing_alarm_id_ = -1;
+    esp_timer_handle_t alarm_beep_timer_ = nullptr;
+
+    void StopAlarmRinging() {
+        if (alarm_ringing_) {
+            alarm_ringing_ = false;
+            ringing_alarm_id_ = -1;
+            if (alarm_beep_timer_) {
+                esp_timer_stop(alarm_beep_timer_);
+            }
+            ESP_LOGI(TAG, "Alarm ringing stopped by user");
+        }
+    }
 
     void InitializePowerManager() {
         adc_battery_monitor_ = new AdcBatteryMonitor(ADC_UNIT_1, ADC_CHANNEL_3, 100000, 100000, GPIO_NUM_12);
@@ -124,8 +144,20 @@ private:
         display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
-    void InitializeButtons() {
+        void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            // 闹钟响铃时，按任意键停止响铃
+            if (alarm_ringing_) {
+                StopAlarmRinging();
+                
+                Application::GetInstance().Schedule([this]() {
+                    auto display = Board::GetInstance().GetDisplay();
+                    display->SetEmotion("neutral");
+                    display->ShowNotification("闹钟已关闭", 2000);
+                });
+                return;
+            }
+            
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -185,6 +217,89 @@ private:
                     return std::string("无法读取温湿度数据");
                 }
             });
+
+        mcp_server.AddTool("self.alarm.set",
+            "Set an alarm.\n"
+            "Parameters:\n"
+            "  hour: Hour (0-23)\n"
+            "  minute: Minute (0-59)\n"
+            "  message: Optional message to display when alarm triggers.\n"
+            "  repeat: Repeat pattern (0=once, 1=Monday, 2=Tuesday, 4=Wednesday, 8=Thursday, 16=Friday, 32=Saturday, 64=Sunday).\n"
+            "Return:\n"
+            "  Alarm ID if successful, error message otherwise.",
+            PropertyList({
+                Property("hour", kPropertyTypeInteger, 0, 0, 23),
+                Property("minute", kPropertyTypeInteger, 0, 0, 59),
+                Property("message", kPropertyTypeString, ""),
+                Property("repeat", kPropertyTypeInteger, 0, 0, 127)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int hour = properties["hour"].value<int>();
+                int minute = properties["minute"].value<int>();
+                std::string message = properties["message"].value<std::string>();
+                int repeat = properties["repeat"].value<int>();
+                
+                if (alarm_manager_->AddAlarm(hour, minute, message, repeat)) {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "闹钟已设置: %02d:%02d", hour, minute);
+                    GetDisplay()->ShowNotification(buf, 3000);
+                    return std::string(buf);
+                } else {
+                    return std::string("设置闹钟失败");
+                }
+            });
+
+        mcp_server.AddTool("self.alarm.list",
+            "List all alarms.\n"
+            "Return:\n"
+            "  JSON array of alarms with id, hour, minute, enabled, message, and repeat.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                auto alarms = alarm_manager_->GetAlarms();
+                if (alarms.empty()) {
+                    return std::string("暂无闹钟");
+                }
+                
+                cJSON* root = cJSON_CreateArray();
+                for (const auto& alarm : alarms) {
+                    cJSON* item = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(item, "id", alarm.id);
+                    cJSON_AddNumberToObject(item, "hour", alarm.hour);
+                    cJSON_AddNumberToObject(item, "minute", alarm.minute);
+                    cJSON_AddBoolToObject(item, "enabled", alarm.enabled);
+                    cJSON_AddStringToObject(item, "message", alarm.message.c_str());
+                    cJSON_AddNumberToObject(item, "repeat", alarm.repeat);
+                    cJSON_AddItemToArray(root, item);
+                }
+                
+                char* buf = cJSON_PrintUnformatted(root);
+                std::string result(buf);
+                cJSON_free(buf);
+                cJSON_Delete(root);
+                return result;
+            });
+
+        mcp_server.AddTool("self.alarm.delete",
+            "Delete an alarm by ID.\n"
+            "Parameters:\n"
+            "  id: Alarm ID to delete.\n"
+            "Return:\n"
+            "  Success message if deleted, error otherwise.",
+            PropertyList({
+                Property("id", kPropertyTypeInteger, 0, 0, 9999)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int id = properties["id"].value<int>();
+                
+                if (alarm_manager_->RemoveAlarm(id)) {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "闹钟 %d 已删除", id);
+                    GetDisplay()->ShowNotification(buf, 3000);
+                    return std::string(buf);
+                } else {
+                    return std::string("删除闹钟失败，未找到该闹钟");
+                }
+            });
     }
 
 public:
@@ -195,6 +310,64 @@ public:
         InitializeAht20();
         InitializeSsd1306Display();
         InitializeButtons();
+        
+                                alarm_manager_ = new AlarmManager();
+        
+        // 创建闹钟响铃定时器，每 3 秒播放一次提示音，直到用户按键停止
+        esp_timer_create_args_t beep_timer_args = {
+            .callback = [](void* arg) {
+                auto* self = static_cast<YuxinC3Board*>(arg);
+                if (self->alarm_ringing_) {
+                    // 通过 Schedule 切换到主任务上下文播放声音
+                    Application::GetInstance().Schedule([]() {
+                        Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+                    });
+                }
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "alarm_beep",
+            .skip_unhandled_events = true
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&beep_timer_args, &alarm_beep_timer_));
+        
+        alarm_manager_->SetAlarmCallback([this](const Alarm& alarm) {
+            char buf[128];
+            if (alarm.message.empty()) {
+                snprintf(buf, sizeof(buf), "闹钟时间到: %02d:%02d", alarm.hour, alarm.minute);
+            } else {
+                snprintf(buf, sizeof(buf), "%s: %02d:%02d", alarm.message.c_str(), alarm.hour, alarm.minute);
+            }
+            
+            // 显示通知到屏幕
+            GetDisplay()->ShowNotification(buf, 5000);
+            
+            // 记录当前响铃的闹钟 ID
+            ringing_alarm_id_ = alarm.id;
+            
+            // 通过 Schedule 在主任务中设置状态并开始循环播放
+            Application::GetInstance().Schedule([this, message = std::string(buf)]() {
+                auto display = Board::GetInstance().GetDisplay();
+                
+                // 设置闹钟响铃标志
+                alarm_ringing_ = true;
+                
+                // 显示闹钟表情
+                display->SetEmotion("alarm_clock");
+                
+                // 立即播放一次提示音
+                Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+                
+                // 启动定时器循环播放（每 3 秒一次）
+                if (alarm_beep_timer_) {
+                    esp_timer_start_periodic(alarm_beep_timer_, 3000000); // 3秒
+                }
+            });
+            
+            ESP_LOGI(TAG, "Alarm triggered: %s", buf);
+        });
+        StartAlarmCheckTask(alarm_manager_);
+        
         InitializeTools();
     }
 
