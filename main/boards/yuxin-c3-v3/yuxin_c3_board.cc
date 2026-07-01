@@ -10,6 +10,7 @@
 #include "power_save_timer.h"
 #include "adc_battery_monitor.h"
 #include "press_to_talk_mcp_tool.h"
+#include "aht20.h"
 
 #include <wifi_manager.h>
 #include <esp_log.h>
@@ -30,6 +31,9 @@ private:
     PowerSaveTimer* power_save_timer_ = nullptr;
     AdcBatteryMonitor* adc_battery_monitor_ = nullptr;
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
+    Aht20* aht20_ = nullptr;
+    float last_temperature_ = 0.0f;
+    float last_humidity_ = 0.0f;
 
     void InitializePowerManager() {
         adc_battery_monitor_ = new AdcBatteryMonitor(ADC_UNIT_1, ADC_CHANNEL_3, 100000, 100000, GPIO_NUM_12);
@@ -146,9 +150,41 @@ private:
         });
     }
 
+    void InitializeAht20() {
+        aht20_ = new Aht20(codec_i2c_bus_, 0x38);
+        if (!aht20_->Initialize()) {
+            ESP_LOGE(TAG, "AHT20 initialization failed");
+            delete aht20_;
+            aht20_ = nullptr;
+        } else {
+            ESP_LOGI(TAG, "AHT20 initialized successfully");
+        }
+    }
+
     void InitializeTools() {
         press_to_talk_tool_ = new PressToTalkMcpTool();
         press_to_talk_tool_->Initialize();
+
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.sensor.get_temperature_humidity",
+            "Get the current temperature and humidity from the AHT20 sensor.\n"
+            "Use this tool when the user asks about temperature or humidity.\n"
+            "Return:\n"
+            "  A JSON object with 'temperature' (in Celsius) and 'humidity' (in percent).",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                float temp, humi;
+                if (aht20_ && aht20_->Read(temp, humi)) {
+                    last_temperature_ = temp;
+                    last_humidity_ = humi;
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "温度: %.1f°C, 湿度: %.1f%%", temp, humi);
+                    GetDisplay()->ShowNotification(buf, 3000);
+                    return std::string(buf);
+                } else {
+                    return std::string("无法读取温湿度数据");
+                }
+            });
     }
 
 public:
@@ -156,6 +192,7 @@ public:
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeCodecI2c();
+        InitializeAht20();
         InitializeSsd1306Display();
         InitializeButtons();
         InitializeTools();
@@ -189,6 +226,30 @@ public:
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveLevel(level);
+    }
+
+    virtual std::string GetDeviceStatusJson() override {
+        std::string json = WifiBoard::GetDeviceStatusJson();
+        cJSON* root = cJSON_Parse(json.c_str());
+
+        if (aht20_) {
+            float temp, humi;
+            if (aht20_->Read(temp, humi)) {
+                last_temperature_ = temp;
+                last_humidity_ = humi;
+            }
+        }
+
+        cJSON* sensor = cJSON_CreateObject();
+        cJSON_AddNumberToObject(sensor, "temperature", last_temperature_);
+        cJSON_AddNumberToObject(sensor, "humidity", last_humidity_);
+        cJSON_AddItemToObject(root, "sensor", sensor);
+
+        char* str = cJSON_PrintUnformatted(root);
+        std::string result(str);
+        cJSON_free(str);
+        cJSON_Delete(root);
+        return result;
     }
 };
 
