@@ -21,6 +21,7 @@
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_heap_caps.h>
 
 #define TAG "YuxinC3Board"
 
@@ -31,13 +32,13 @@ private:
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
     Button boot_button_;
-    PowerSaveTimer* power_save_timer_ = nullptr;
-    AdcBatteryMonitor* adc_battery_monitor_ = nullptr;
-    PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
+    PowerSaveTimer power_save_timer_;
+    AdcBatteryMonitor adc_battery_monitor_;
+    PressToTalkMcpTool press_to_talk_tool_;
     Aht20* aht20_ = nullptr;
     float last_temperature_ = 0.0f;
     float last_humidity_ = 0.0f;
-        AlarmManager* alarm_manager_ = nullptr;
+    AlarmManager alarm_manager_;
     
     // 闹钟响铃状态
     bool alarm_ringing_ = false;
@@ -56,25 +57,23 @@ private:
     }
 
     void InitializePowerManager() {
-        adc_battery_monitor_ = new AdcBatteryMonitor(ADC_UNIT_1, ADC_CHANNEL_3, 100000, 100000, GPIO_NUM_12);
-        adc_battery_monitor_->OnChargingStatusChanged([this](bool is_charging) {
+        adc_battery_monitor_.OnChargingStatusChanged([this](bool is_charging) {
             if (is_charging) {
-                power_save_timer_->SetEnabled(false);
+                power_save_timer_.SetEnabled(false);
             } else {
-                power_save_timer_->SetEnabled(true);
+                power_save_timer_.SetEnabled(true);
             }
         });
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(160, 300);
-        power_save_timer_->OnEnterSleepMode([this]() {
+        power_save_timer_.OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
         });
-        power_save_timer_->OnExitSleepMode([this]() {
+        power_save_timer_.OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
         });
-        power_save_timer_->SetEnabled(true);
+        power_save_timer_.SetEnabled(true);
     }
 
     void InitializeCodecI2c() {
@@ -163,20 +162,18 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
-            if (!press_to_talk_tool_ || !press_to_talk_tool_->IsPressToTalkEnabled()) {
+            if (!press_to_talk_tool_.IsPressToTalkEnabled()) {
                 app.ToggleChatState();
             }
         });
         boot_button_.OnPressDown([this]() {
-            if (power_save_timer_) {
-                power_save_timer_->WakeUp();
-            }
-            if (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled()) {
+            power_save_timer_.WakeUp();
+            if (press_to_talk_tool_.IsPressToTalkEnabled()) {
                 Application::GetInstance().StartListening();
             }
         });
         boot_button_.OnPressUp([this]() {
-            if (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled()) {
+            if (press_to_talk_tool_.IsPressToTalkEnabled()) {
                 Application::GetInstance().StopListening();
             }
         });
@@ -194,8 +191,7 @@ private:
     }
 
     void InitializeTools() {
-        press_to_talk_tool_ = new PressToTalkMcpTool();
-        press_to_talk_tool_->Initialize();
+        press_to_talk_tool_.Initialize();
 
         auto& mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.sensor.get_temperature_humidity",
@@ -239,7 +235,7 @@ private:
                 std::string message = properties["message"].value<std::string>();
                 int repeat = properties["repeat"].value<int>();
                 
-                if (alarm_manager_->AddAlarm(hour, minute, message, repeat)) {
+                if (alarm_manager_.AddAlarm(hour, minute, message, repeat)) {
                     char buf[128];
                     snprintf(buf, sizeof(buf), "闹钟已设置: %02d:%02d", hour, minute);
                     GetDisplay()->ShowNotification(buf, 3000);
@@ -255,7 +251,7 @@ private:
             "  JSON array of alarms with id, hour, minute, enabled, message, and repeat.",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
-                auto alarms = alarm_manager_->GetAlarms();
+                auto alarms = alarm_manager_.GetAlarms();
                 if (alarms.empty()) {
                     return std::string("暂无闹钟");
                 }
@@ -291,7 +287,7 @@ private:
             [this](const PropertyList& properties) -> ReturnValue {
                 int id = properties["id"].value<int>();
                 
-                if (alarm_manager_->RemoveAlarm(id)) {
+                if (alarm_manager_.RemoveAlarm(id)) {
                     char buf[128];
                     snprintf(buf, sizeof(buf), "闹钟 %d 已删除", id);
                     GetDisplay()->ShowNotification(buf, 3000);
@@ -303,15 +299,16 @@ private:
     }
 
 public:
-    YuxinC3Board() : boot_button_(BOOT_BUTTON_GPIO, false, 0, 0, true) {  
+    YuxinC3Board() : 
+        boot_button_(BOOT_BUTTON_GPIO, false, 0, 0, true),
+        power_save_timer_(160, 300),
+        adc_battery_monitor_(ADC_UNIT_1, ADC_CHANNEL_3, 100000, 100000, GPIO_NUM_12) {  
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeCodecI2c();
         InitializeAht20();
         InitializeSsd1306Display();
         InitializeButtons();
-        
-                                alarm_manager_ = new AlarmManager();
         
         // 创建闹钟响铃定时器，每 3 秒播放一次提示音，直到用户按键停止
         esp_timer_create_args_t beep_timer_args = {
@@ -331,7 +328,7 @@ public:
         };
         ESP_ERROR_CHECK(esp_timer_create(&beep_timer_args, &alarm_beep_timer_));
         
-        alarm_manager_->SetAlarmCallback([this](const Alarm& alarm) {
+        alarm_manager_.SetAlarmCallback([this](const Alarm& alarm) {
             char buf[128];
             if (alarm.message.empty()) {
                 snprintf(buf, sizeof(buf), "闹钟时间到: %02d:%02d", alarm.hour, alarm.minute);
@@ -366,9 +363,12 @@ public:
             
             ESP_LOGI(TAG, "Alarm triggered: %s", buf);
         });
-        StartAlarmCheckTask(alarm_manager_);
+        StartAlarmCheckTask(&alarm_manager_);
         
         InitializeTools();
+
+        ESP_LOGI(TAG, "Board initialization complete - free heap: %d bytes, largest free block: %d bytes",
+                 esp_get_free_heap_size(), heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
 
     virtual Led* GetLed() override {
@@ -388,15 +388,15 @@ public:
     }
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        charging = adc_battery_monitor_->IsCharging();
-        discharging = adc_battery_monitor_->IsDischarging();
-        level = adc_battery_monitor_->GetBatteryLevel();
+        charging = adc_battery_monitor_.IsCharging();
+        discharging = adc_battery_monitor_.IsDischarging();
+        level = adc_battery_monitor_.GetBatteryLevel();
         return true;
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
         if (level != PowerSaveLevel::LOW_POWER) {
-            power_save_timer_->WakeUp();
+            power_save_timer_.WakeUp();
         }
         WifiBoard::SetPowerSaveLevel(level);
     }
@@ -404,14 +404,6 @@ public:
     virtual std::string GetDeviceStatusJson() override {
         std::string json = WifiBoard::GetDeviceStatusJson();
         cJSON* root = cJSON_Parse(json.c_str());
-
-        if (aht20_) {
-            float temp, humi;
-            if (aht20_->Read(temp, humi)) {
-                last_temperature_ = temp;
-                last_humidity_ = humi;
-            }
-        }
 
         cJSON* sensor = cJSON_CreateObject();
         cJSON_AddNumberToObject(sensor, "temperature", last_temperature_);

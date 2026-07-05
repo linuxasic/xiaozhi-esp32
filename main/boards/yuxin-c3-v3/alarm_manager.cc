@@ -32,22 +32,30 @@ Alarm Alarm::FromJson(const std::string& json_str) {
     Alarm alarm;
     cJSON* json = cJSON_Parse(json_str.c_str());
     if (json) {
-        cJSON* id = cJSON_GetObjectItem(json, "id");
-        cJSON* hour = cJSON_GetObjectItem(json, "hour");
-        cJSON* minute = cJSON_GetObjectItem(json, "minute");
-        cJSON* enabled = cJSON_GetObjectItem(json, "enabled");
-        cJSON* message = cJSON_GetObjectItem(json, "message");
-        cJSON* repeat = cJSON_GetObjectItem(json, "repeat");
-        
-        if (id) alarm.id = id->valueint;
-        if (hour) alarm.hour = hour->valueint;
-        if (minute) alarm.minute = minute->valueint;
-        if (enabled) alarm.enabled = enabled->valueint != 0;
-        if (message && message->valuestring) alarm.message = message->valuestring;
-        if (repeat) alarm.repeat = repeat->valueint;
-        
+        alarm = FromCJsonObject(json);
         cJSON_Delete(json);
     }
+    return alarm;
+}
+
+Alarm Alarm::FromCJsonObject(cJSON* json) {
+    Alarm alarm;
+    if (!json) return alarm;
+    
+    cJSON* id = cJSON_GetObjectItem(json, "id");
+    cJSON* hour = cJSON_GetObjectItem(json, "hour");
+    cJSON* minute = cJSON_GetObjectItem(json, "minute");
+    cJSON* enabled = cJSON_GetObjectItem(json, "enabled");
+    cJSON* message = cJSON_GetObjectItem(json, "message");
+    cJSON* repeat = cJSON_GetObjectItem(json, "repeat");
+    
+    if (id) alarm.id = id->valueint;
+    if (hour) alarm.hour = hour->valueint;
+    if (minute) alarm.minute = minute->valueint;
+    if (enabled) alarm.enabled = enabled->valueint != 0;
+    if (message && message->valuestring) alarm.message = message->valuestring;
+    if (repeat) alarm.repeat = repeat->valueint;
+    
     return alarm;
 }
 
@@ -158,7 +166,12 @@ void AlarmManager::LoadAlarms() {
     size_t len = 0;
     err = nvs_get_str(handle, "list", nullptr, &len);
     if (err == ESP_OK && len > 0) {
-        char* buf = new char[len];
+        char buf[512];
+        if (len > sizeof(buf)) {
+            ESP_LOGW(TAG, "Alarm list too large: %zu bytes", len);
+            nvs_close(handle);
+            return;
+        }
         err = nvs_get_str(handle, "list", buf, &len);
         if (err == ESP_OK) {
             cJSON* root = cJSON_Parse(buf);
@@ -168,16 +181,12 @@ void AlarmManager::LoadAlarms() {
                 for (int i = 0; i < size; i++) {
                     cJSON* item = cJSON_GetArrayItem(root, i);
                     if (item) {
-                        char* item_str = cJSON_PrintUnformatted(item);
-                        Alarm alarm = Alarm::FromJson(item_str);
-                        // 启动时自动清理已禁用的一次性闹钟（兼容旧版本积累的垃圾数据）
+                        Alarm alarm = Alarm::FromCJsonObject(item);
                         if (!alarm.enabled && alarm.repeat == 0) {
                             ESP_LOGI(TAG, "Skipping disabled one-time alarm %d during load", alarm.id);
-                            cJSON_free(item_str);
                             continue;
                         }
                         alarms_.push_back(alarm);
-                        cJSON_free(item_str);
                     }
                 }
                 ESP_LOGI(TAG, "Loaded %d alarms from NVS", alarms_.size());
@@ -188,7 +197,6 @@ void AlarmManager::LoadAlarms() {
         } else {
             ESP_LOGW(TAG, "Failed to read NVS string: %s", esp_err_to_name(err));
         }
-        delete[] buf;
     } else if (err != ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGW(TAG, "NVS get string result: %s", esp_err_to_name(err));
     }
@@ -277,5 +285,36 @@ void AlarmManager::SetAlarmCallback(std::function<void(const Alarm&)> callback) 
 void AlarmManager::TriggerAlarm(const Alarm& alarm) {
     if (on_alarm_triggered_) {
         on_alarm_triggered_(alarm);
+    }
+}
+
+void AlarmManager::CheckAndTriggerAlarms(int hour, int minute, int day_of_week) {
+    std::lock_guard<std::recursive_mutex> lock(g_alarm_mutex);
+    
+    for (auto it = alarms_.begin(); it != alarms_.end(); ) {
+        const auto& alarm = *it;
+        if (alarm.enabled && alarm.hour == hour && alarm.minute == minute) {
+            bool should_trigger = true;
+            
+            if (alarm.repeat > 0) {
+                uint8_t repeat_mask = static_cast<uint8_t>(alarm.repeat);
+                uint8_t day_bit = 1 << day_of_week;
+                should_trigger = (repeat_mask & day_bit) != 0;
+            }
+            
+            if (should_trigger) {
+                ESP_LOGI(TAG, "Alarm triggered: %d %02d:%02d", alarm.id, alarm.hour, alarm.minute);
+                
+                TriggerAlarm(alarm);
+                
+                if (alarm.repeat == 0) {
+                    it = alarms_.erase(it);
+                    SaveAlarms();
+                    ESP_LOGI(TAG, "One-time alarm %d triggered and auto-deleted", alarm.id);
+                    continue;
+                }
+            }
+        }
+        ++it;
     }
 }

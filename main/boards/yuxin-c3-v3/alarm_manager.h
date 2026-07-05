@@ -4,6 +4,7 @@
 #include <string>
 #include <functional>
 #include <mutex>
+#include <cJSON.h>
 
 struct Alarm {
     int id;
@@ -15,6 +16,7 @@ struct Alarm {
 
     std::string ToJson() const;
     static Alarm FromJson(const std::string& json);
+    static Alarm FromCJsonObject(cJSON* json);
 };
 
 class AlarmManager {
@@ -33,6 +35,7 @@ public:
 
     void SetAlarmCallback(std::function<void(const Alarm&)> callback);
     void TriggerAlarm(const Alarm& alarm);
+    void CheckAndTriggerAlarms(int hour, int minute, int day_of_week);
 
 private:
     std::vector<Alarm> alarms_;

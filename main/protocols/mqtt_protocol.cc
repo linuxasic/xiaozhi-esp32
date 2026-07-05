@@ -186,7 +186,23 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         return false;
     }
 
-    return udp_->Send(encrypted) > 0;
+    const int max_retries = 3;
+    const int retry_delay_ms = 5;
+    for (int i = 0; i < max_retries; ++i) {
+        int ret = udp_->Send(encrypted);
+        if (ret > 0) {
+            return true;
+        }
+        if (i < max_retries - 1) {
+            ESP_LOGW(TAG, "UDP send failed, retrying (%d/%d), free heap: %d bytes", 
+                     i + 1, max_retries, esp_get_free_heap_size());
+            vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
+        }
+    }
+
+    ESP_LOGE(TAG, "UDP send failed after %d retries, free heap: %d bytes", 
+             max_retries, esp_get_free_heap_size());
+    return false;
 }
 
 void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
